@@ -4,4 +4,5 @@ google-genai
 pdf2image
 Pillow
 tenacity
+google.generativeai
 openpyxl
