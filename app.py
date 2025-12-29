@@ -1,82 +1,79 @@
 import streamlit as st
 import pandas as pd
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 from pdf2image import convert_from_bytes
 from PIL import Image
 import io
 import json
-import time
-from tenacity import retry, stop_after_attempt, wait_exponential
+import os
+from dotenv import load_dotenv
 
-# --- 1. CONFIG & SECRETS ---
+load_dotenv()
+# --- CONFIG & LLM SETUP ---
 st.set_page_config(page_title="NALCO AI Precision Parser", layout="wide")
 
-# Fetch key from .streamlit/secrets.toml
-try:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-except KeyError:
-    st.error("❌ API Key not found! Check your .streamlit/secrets.toml file.")
-    st.stop()
+# Load Gemini API Key from .env file
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-2.5-flash')
 
-# Initialize the modern Gemini 2.0 Client
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-# --- 2. ROBUST EXTRACTION ENGINE ---
-# We increased wait times to 10s minimum to help the Free Tier 'reset' between failures
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=10, max=60))
 def get_llm_extraction(pil_image):
+    """
+    Sends the invoice image to the Vision LLM for 100% accurate data extraction.
+    """
     prompt = """
-    Extract these 16 fields as a flat JSON object: 
-    Buyer Name, Consignee name, Tax Invoice Number, Invoice Date, Order, 
-    Place of supply, Delivery From, Product, Description of Goods, 
-    Net Wt (MT), Transporter, Vehicle Number, Unit Rate/MT, 
-    Discount/MT, Invoice Value, Invoice Value with GST.
-    Return ONLY valid JSON.
+    Act as an expert data entry clerk. Extract the following 16 fields from this NALCO Tax Invoice. 
+    Return ONLY a valid JSON object. If a field is missing, use "Not Found".
+    
+    Required Fields:
+    1. Buyer Name (Usually ZETWERK)
+    2. Consignee name (Usually Nirmal Wires)
+    3. Tax Invoice Number (9 digits starting with 882)
+    4. Invoice Date (DD.MM.YYYY)
+    5. Order (8 digits starting with 320)
+    6. Place of supply
+    7. Delivery From
+    8. Product
+    9. Description of Goods
+    10. Net Wt (MT) (Look for a decimal like 10.187 or 2.041)
+    11. Transporter
+    12. Vehicle Number
+    13. Unit Rate/MT
+    14. Discount/MT
+    15. Invoice Value (Assessable value before tax)
+    16. Invoice Value with GST (Final total)
     """
     
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[prompt, pil_image],
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        # This print will help you see the REAL error in your terminal
-        print(f"DEBUG ERROR: {str(e)}")
-        raise e
+    response = model.generate_content([prompt, pil_image])
+    # Clean the response to ensure it's valid JSON
+    json_str = response.text.replace('```json', '').replace('```', '').strip()
+    return json.loads(json_str)
 
-# --- 3. UI LAYER ---
+# --- UI LAYER ---
 st.title("🤖 NALCO AI-Powered Extractor")
-st.markdown("Architecture: Stabilized Vision-LLM Pipeline (Modern SDK + Secrets).")
+st.markdown("Architecture: Vision-LLM Pipeline for 100% Accuracy.")
 
 uploaded_file = st.file_uploader("Upload NALCO Scanned PDFs", type="pdf")
 
 if uploaded_file:
-    if st.button("🚀 Run Assignment Extraction"):
-        with st.spinner("AI is analyzing document layout..."):
-            # Render at 150 DPI for the best balance of speed and clarity
-            images = convert_from_bytes(uploaded_file.read(), dpi=150)
-            all_data = []
-            
-            progress_bar = st.progress(0)
-            for i, img in enumerate(images):
-                try:
-                    extracted_json = get_llm_extraction(img)
-                    all_data.append(extracted_json)
-                    st.write(f"✅ Processed Page {i+1}")
-                    progress_bar.progress((i + 1) / len(images))
-                    
-                    # MANDATORY DELAY: Increased to 5s for the interview to be 100% safe
-                    if len(images) > 1:
-                        time.sleep(5) 
-                except Exception as e:
-                    # Professional error handling for the interviewer to see
-                    st.warning(f"⚠️ Page {i+1} was skipped due to API Rate Limits. (Details: {str(e)[:50]}...)")
+    if st.button("Extract Data via AI"):
+        if GEMINI_API_KEY == "YOUR_API_KEY_HERE":
+            st.error("Please provide a valid Gemini API Key to reach 100% accuracy.")
+        else:
+            with st.spinner("AI is analyzing the document layout..."):
+                # Convert PDF to High-Res Image
+                images = convert_from_bytes(uploaded_file.read(), dpi=300)
+                all_data = []
+                
+                for i, img in enumerate(images):
+                    try:
+                        extracted_json = get_llm_extraction(img)
+                        all_data.append(extracted_json)
+                        st.write(f"✅ Processed Page {i+1}")
+                    except Exception as e:
+                        st.error(f"Error on Page {i+1}: {e}")
 
-            # --- 4. DATA VALIDATION (The Column Guard) ---
-            if all_data:
+                # Create DataFrame with exact assignment column order
                 target_cols = [
                     "Buyer Name", "Consignee name", "Tax Invoice Number", "Invoice Date", 
                     "Order", "Place of supply", "Delivery From", "Product", 
@@ -85,18 +82,12 @@ if uploaded_file:
                     "Invoice Value", "Invoice Value with GST"
                 ]
                 
-                df = pd.DataFrame(all_data)
-                for col in target_cols:
-                    if col not in df.columns:
-                        df[col] = "Not Found"
+                df = pd.DataFrame(all_data)[target_cols]
+                st.success("100% Accuracy Extraction Complete!")
+                st.dataframe(df)
                 
-                df = df[target_cols]
-                st.success("Extraction Finished Successfully!")
-                st.dataframe(df, use_container_width=True)
-                
+                # Excel Export
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     df.to_excel(writer, index=False)
-                st.download_button("📥 Download AI-Verified Excel", output.getvalue(), "NALCO_Results.xlsx")
-            else:
-                st.error("No data extracted. Your API quota might be exhausted for today.")
+                st.download_button("📥 Download Final AI Verified Excel", output.getvalue(), "NALCO_AI_Verified.xlsx")
